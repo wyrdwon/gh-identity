@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Fake gh for tests. State:
+#   $FAKE_GH_DIR/active   active login
+#   $FAKE_GH_DIR/logins   logged-in logins, one per line
+set -euo pipefail
+dir=${FAKE_GH_DIR:?}
+printf '%s\n' "$*" >>"$dir/calls"
+
+case "$1 $2" in
+"config get") cat "$dir/active" 2>/dev/null ;;
+"auth status") cat "$dir/logins" ;;
+"auth switch")
+  while [[ $# -gt 0 ]]; do
+    [[ $1 == --user ]] && user=$2
+    shift
+  done
+  grep -qxF "${user:?}" "$dir/logins" || exit 1
+  printf '%s\n' "$user" >"$dir/active"
+  ;;
+*) echo "fake gh: unhandled: $*" >&2 && exit 2 ;;
+esac

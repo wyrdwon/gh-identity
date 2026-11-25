@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# gh-identity: switch GitHub accounts (gh CLI login + git author identity)
+# from a single config file.
+#
+# Design notes:
+#   - Config is git-config format, so `git config --file` is the parser.
+#   - The active identity is written to its own gitconfig fragment that your
+#     ~/.gitconfig includes. Your ~/.gitconfig is never modified.
+#   - State lives in files, not environment variables, so every shell (and
+#     every prompt) sees a switch immediately.
+set -euo pipefail
+
+readonly VERSION="0.1.0"
+readonly HOST="${GH_IDENTITY_HOST:-github.com}"
+readonly CONFIG_FILE="${GH_IDENTITY_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/gh-identity/accounts}"
+readonly STATE_DIR="${GH_IDENTITY_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gh-identity}"
+readonly GITCONFIG_FILE="$STATE_DIR/gitconfig"
+readonly CURRENT_FILE="$STATE_DIR/current"
+
+die() {
+  printf 'gh-identity: %s\n' "$*" >&2
+  exit 1
+}
+
+# --- config ------------------------------------------------------------------
+
+require_config() {
+  [[ -r $CONFIG_FILE ]] || die "no config at $CONFIG_FILE (run 'gh identity help' for the format)"
+}
+
+# cfg <alias> <key>: print a value, or nothing if unset.
+cfg() {
+  git config --file "$CONFIG_FILE" --get "account.$1.$2" 2>/dev/null || true
+}
+
+# Every account alias that defines a `user`, in file order.
+account_aliases() {
+  git config --file "$CONFIG_FILE" --name-only --get-regexp '^account\..*\.user$' 2>/dev/null |
+    sed 's/^account\.\(.*\)\.user$/\1/'
+}
+
+# --- gh ----------------------------------------------------------------------
+
+# Active gh login for $HOST. Reads gh's local hosts file; no network.
+active_login() {
+  gh config get user --host "$HOST" 2>/dev/null || true
+}
+
+# Every login gh holds a token for on $HOST. Hits the network.
+known_logins() {
+  gh auth status --hostname "$HOST" --json hosts --jq ".hosts[\"$HOST\"][].login" 2>/dev/null || true
+}
+
+# --- state -------------------------------------------------------------------
+
+current_alias() {
+  [[ -r $CURRENT_FILE ]] && cat "$CURRENT_FILE" || true
+}
+
+# Atomically replace a file's contents with stdin.
+write_atomic() {
+  local dest=$1 tmp
+  tmp=$(mktemp "$dest.XXXXXX")
+  cat >"$tmp"
+  mv -f "$tmp" "$dest"
+}
+
+write_state() {
+  local alias=$1 name=$2 email=$3 signingkey=$4 tmp
+  mkdir -p "$STATE_DIR"
+
+  # Let git do the quoting/escaping of values.
+  tmp=$(mktemp "$GITCONFIG_FILE.XXXXXX")
+  git config --file "$tmp" user.name "$name"
+  git config --file "$tmp" user.email "$email"
+  if [[ -n $signingkey ]]; then
+    git config --file "$tmp" user.signingkey "$signingkey"
+  fi
+  mv -f "$tmp" "$GITCONFIG_FILE"
+
+  printf '%s\n' "$alias" | write_atomic "$CURRENT_FILE"
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_use() {
+  [[ $# -eq 1 ]] || die "usage: gh identity use <account>"
+  require_config
+
+  local alias=$1 user name email signingkey
+  user=$(cfg "$alias" user)
+  [[ -n $user ]] || die "unknown account '$alias' (known: $(account_aliases | paste -sd' ' -))"
+  email=$(cfg "$alias" email)
+  [[ -n $email ]] || die "account '$alias' has no email in $CONFIG_FILE"
+  name=$(cfg "$alias" name)
+  name=${name:-$user}
+  signingkey=$(cfg "$alias" signingkey)
+
+  if [[ $(active_login) != "$user" ]]; then
+    gh auth switch --hostname "$HOST" --user "$user" >/dev/null 2>&1 ||
+      die "gh could not switch to '$user'; log it in first: gh auth login --hostname $HOST"
+  fi
+
+  # Always rewrite state, even when gh was already on this account: it
+  # repairs drift and keeps 'use' idempotent.
+  write_state "$alias" "$name" "$email" "$signingkey"
+  printf 'Using %s: %s, %s <%s>\n' "$alias" "$user" "$name" "$email"
+}
+
+cmd_current() {
+  local alias
+  alias=$(current_alias)
+  [[ -n $alias ]] || exit 1
+  printf '%s\n' "$alias"
+}
+
+cmd_list() {
+  require_config
+  local current alias marker
+  current=$(current_alias)
+  while IFS= read -r alias; do
+    marker=' '
+    [[ $alias == "$current" ]] && marker='*'
+    printf '%s %-12s %-20s %s <%s>\n' "$marker" "$alias" "$(cfg "$alias" user)" \
+      "$(cfg "$alias" name)" "$(cfg "$alias" email)"
+  done < <(account_aliases)
+}
+
+# Check everything that can make a switch silently not take effect.
+cmd_doctor() {
+  local problems=0 alias user logins current effective expected
+
+  ok() { printf '  ok    %s\n' "$*"; }
+  bad() {
+    printf '  FAIL  %s\n' "$*"
+    problems=$((problems + 1))
+  }
+
+  printf 'config: %s\n' "$CONFIG_FILE"
+  require_config
+  logins=$(known_logins)
+  while IFS= read -r alias; do
+    user=$(cfg "$alias" user)
+    if [[ -z $(cfg "$alias" email) ]]; then
+      bad "$alias: no email"
+    elif ! grep -qxF "$user" <<<"$logins"; then
+      bad "$alias: gh is not logged in as '$user' (gh auth login --hostname $HOST)"
+    else
+      ok "$alias: $user"
+    fi
+  done < <(account_aliases)
+  [[ -n $(account_aliases) ]] || bad "no [account \"...\"] sections with a 'user'"
+
+  printf 'git:    %s\n' "$GITCONFIG_FILE"
+  if git config --global --get-all include.path 2>/dev/null |
+    sed "s|^~|$HOME|" | grep -qxF "$GITCONFIG_FILE"; then
+    ok "global gitconfig includes the identity file"
+  else
+    bad "add to ~/.gitconfig (after any [user] section):  [include] path = $GITCONFIG_FILE"
+  fi
+
+  current=$(current_alias)
+  if [[ -z $current ]]; then
+    bad "no identity selected yet (gh identity use <account>)"
+  else
+    expected=$(cfg "$current" email)
+    effective=$(git config --global --includes --get user.email 2>/dev/null || true)
+    if [[ $effective == "$expected" ]]; then
+      ok "git user.email is $effective"
+    else
+      bad "git user.email is '$effective', expected '$expected' (is a [user] section after the include?)"
+    fi
+    if [[ $(active_login) == "$(cfg "$current" user)" ]]; then
+      ok "gh active account matches '$current'"
+    else
+      bad "gh active account is '$(active_login)', expected '$(cfg "$current" user)' (re-run: gh identity use $current)"
+    fi
+  fi
+
+  ((problems == 0))
+}
+
+cmd_help() {
+  cat <<EOF
+gh-identity $VERSION: switch GitHub accounts for gh and git together.
+
+Usage:
+  gh identity use <account>   Switch gh's active login and git's author identity
+  gh identity current         Print the active account (exit 1 if none)
+  gh identity list            List configured accounts (* marks the active one)
+  gh identity doctor          Check config, gh logins and git wiring
+  gh identity help            Show this help
+
+Config ($CONFIG_FILE), git-config format:
+
+  [account "personal"]
+      user       = octocat              # gh login (required)
+      email      = octocat@example.com  # git user.email (required)
+      name       = Mona Octocat         # git user.name (default: user)
+      signingkey = ~/.ssh/id_ed25519.pub  # git user.signingkey (optional)
+      color      = 39                   # prompt colour (optional, zsh plugin)
+      icon       = 󰠥                    # prompt icon (optional, zsh plugin)
+
+One-time setup:
+  1. gh auth login            (once per account)
+  2. Add to ~/.gitconfig, after any [user] section:
+       [include]
+           path = $GITCONFIG_FILE
+  3. gh identity doctor
+
+Environment:
+  GH_IDENTITY_CONFIG     Config file path
+  GH_IDENTITY_STATE_DIR  State directory
+  GH_IDENTITY_HOST       GitHub host (default: github.com)
+EOF
+}
+
+main() {
+  local cmd=${1:-help}
+  [[ $# -gt 0 ]] && shift
+  case $cmd in
+  use) cmd_use "$@" ;;
+  current) cmd_current ;;
+  list | ls) cmd_list ;;
+  doctor) cmd_doctor ;;
+  help | -h | --help) cmd_help ;;
+  version | --version) printf '%s\n' "$VERSION" ;;
+  *) die "unknown command '$cmd' (see 'gh identity help')" ;;
+  esac
+}
+
+main "$@"

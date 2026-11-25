@@ -1,0 +1,17 @@
+# ~/.config/gh-identity/accounts
+# git-config format. One [account "<alias>"] section per GitHub account;
+# the alias is what you type: `gh identity use <alias>`.
+
+[account "personal"]
+    user  = octocat               # gh login (required)
+    email = octocat@example.com   # git user.email (required)
+    name  = Mona Octocat          # git user.name (defaults to user)
+    color = 39                    # zsh plugin: prompt colour (0-255)
+    icon  = 󰠥                     # zsh plugin: prompt icon
+
+[account "work"]
+    user       = mona-acme
+    email      = mona@acme.example
+    signingkey = ~/.ssh/id_ed25519_acme.pub
+    color      = 214
+    icon       = 󰳰
