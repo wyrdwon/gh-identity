@@ -77,7 +77,7 @@ prompt_gh_identity() {
   local text=${_gh_identity_cfg[$alias.user]:-$alias}
   local fg=${_gh_identity_cfg[$alias.color]:-${POWERLEVEL9K_GH_IDENTITY_FOREGROUND:-244}}
   local icon=${_gh_identity_cfg[$alias.icon]:-${POWERLEVEL9K_GH_IDENTITY_ICON:-}}
-  p10k segment -f $fg -i $icon -t $text
+  p10k segment -f "$fg" -i "$icon" -t "$text"
 }
 
 # Reading a file is instant, so instant prompt can use the same function.
